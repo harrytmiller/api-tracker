@@ -1,1287 +1,455 @@
 import React, { useState, useEffect } from 'react';
-import { signOut } from 'firebase/auth';
-import { auth, db } from '../config/firebase';
-import { collection, addDoc, onSnapshot, updateDoc, doc, query, where, deleteDoc } from 'firebase/firestore';
-import { Filter } from 'lucide-react';
 
-function Dashboard({ user }) {
-  const [jobs, setJobs] = useState([]);
-  const [showAddModal, setShowAddModal] = useState(false);
-  const [showLeftFilter, setShowLeftFilter] = useState(false);
-  const [showRightFilter, setShowRightFilter] = useState(false);
-  const [darkMode, setDarkMode] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [addingJob, setAddingJob] = useState(false);
+const emptyAnalysis = {
+  specName: null,
+  totalEndpoints: 0,
+  trafficSamples: 0,
+  endpoints: [],
+  mismatches: [],
+  breakingRisks: [],
+  fieldUsage: []
+};
+
+function analyzeApiContract(specData, trafficData) {
+  const analysis = {
+    specName: specData?.info?.title || 'API Spec',
+    totalEndpoints: 0,
+    trafficSamples: 0,
+    endpoints: [],
+    mismatches: [],
+    breakingRisks: [],
+    fieldUsage: []
+  };
+
+  const specEndpoints = {};
+  if (specData?.paths) {
+    Object.entries(specData.paths).forEach(([path, methods]) => {
+      Object.entries(methods).forEach(([method, details]) => {
+        if (['get', 'post', 'put', 'patch', 'delete'].includes(method)) {
+          const key = `${method.toUpperCase()} ${path}`;
+          specEndpoints[key] = { method: method.toUpperCase(), path, deprecated: details.deprecated || false };
+        }
+      });
+    });
+  }
+
+  const trafficStats = trafficData?.aggregated_stats?.by_endpoint || {};
+  const fieldPresence = trafficData?.aggregated_stats?.field_presence || {};
+  const typeObservations = trafficData?.aggregated_stats?.type_observations || {};
   
-  const [newJob, setNewJob] = useState({
-    companyName: '',
-    role: '',
-    applyDate: new Date().toISOString().split('T')[0],
-    status: 'Applied'
+  analysis.trafficSamples = trafficData?.meta?.total_requests || 0;
+  analysis.totalEndpoints = Object.keys(specEndpoints).length;
+
+  Object.entries(specEndpoints).forEach(([key, spec]) => {
+    const hits = trafficStats[key]?.count || 0;
+    let risk = 'ok';
+    if (hits === 0) risk = 'dead';
+    else if (spec.deprecated) risk = 'warning';
+
+    analysis.endpoints.push({ method: spec.method, path: spec.path, hits, risk });
   });
-  
-  const [leftDateRange, setLeftDateRange] = useState({ start: '', end: '' });
-  const [rightDateRange, setRightDateRange] = useState({ start: '', end: '' });
 
-  const STATUS_OPTIONS = [
-    'Applied',
-    'First next step',
-    'Passed next step',
-    'Interview',
-    'Offer received'
+  analysis.endpoints.sort((a, b) => b.hits - a.hits);
+
+  Object.entries(fieldPresence).forEach(([endpoint, fields]) => {
+    Object.entries(fields).forEach(([field, pct]) => {
+      const pctNum = parseFloat(pct);
+      if (field.includes('metadata') || field.includes('_v2')) {
+        analysis.mismatches.push({ type: 'extra', endpoint, field, frequency: pct, severity: 'warning' });
+      }
+      if (pctNum === 0 && !field.includes('metadata')) {
+        analysis.mismatches.push({ type: 'unused', endpoint, field, frequency: pct, severity: 'warning' });
+      }
+    });
+  });
+
+  Object.entries(typeObservations).forEach(([endpoint, fields]) => {
+    Object.entries(fields).forEach(([field, data]) => {
+      if (data.observed && Object.keys(data.observed).length > 1) {
+        const actualType = Object.keys(data.observed).find(t => t !== data.expected);
+        const actualPct = data.observed[actualType] || '?';
+        analysis.mismatches.push({
+          type: 'type',
+          endpoint,
+          field,
+          expected: data.expected,
+          actual: actualType,
+          frequency: actualPct,
+          severity: 'error'
+        });
+      }
+    });
+  });
+
+  // Breaking risks - analyze what would break if removed
+  Object.entries(fieldPresence).forEach(([endpoint, fields]) => {
+    Object.entries(fields).forEach(([field, pct]) => {
+      const pctNum = parseFloat(pct);
+      if (!field.includes('.')) {
+        let severity = 'high';
+        if (pctNum < 30) severity = 'medium';
+        if (pctNum < 5) severity = 'safe';
+        
+        analysis.breakingRisks.push({
+          action: 'Field',
+          target: field,
+          impact: pctNum < 5 ? 'Safe to delete' : `Dont delete — ${pct} of traffic`,
+          severity
+        });
+      }
+    });
+  });
+
+  // Dead endpoints are safe to remove
+  analysis.endpoints.forEach(ep => {
+    if (ep.risk === 'dead') {
+      analysis.breakingRisks.push({
+        action: 'Endpoint',
+        target: `${ep.method} ${ep.path}`,
+        impact: 'Safe to delete — no traffic',
+        severity: 'safe'
+      });
+    }
+    if (ep.risk === 'warning') {
+      analysis.breakingRisks.push({
+        action: 'Endpoint',
+        target: `${ep.method} ${ep.path}`,
+        impact: `Deprecated — still ${ep.hits.toLocaleString()} requests`,
+        severity: 'deprecated'
+      });
+    }
+  });
+
+  // Field usage
+  const firstEndpoint = Object.entries(fieldPresence)[0];
+  if (firstEndpoint) {
+    Object.entries(firstEndpoint[1]).slice(0, 8).forEach(([field, pct]) => {
+      analysis.fieldUsage.push({ field, usage: parseFloat(pct) });
+    });
+    analysis.fieldUsage.sort((a, b) => b.usage - a.usage);
+  }
+
+  return analysis;
+}
+
+export default function APIDashboard({ analysis: propAnalysis, onUpload }) {
+  const [analysis, setAnalysis] = useState(propAnalysis || emptyAnalysis);
+  const [uploadDrag, setUploadDrag] = useState(false);
+  const [specFile, setSpecFile] = useState(null);
+  const [trafficFile, setTrafficFile] = useState(null);
+  const fileInputRef = React.useRef(null);
+
+  useEffect(() => { if (propAnalysis) setAnalysis(propAnalysis); }, [propAnalysis]);
+
+  useEffect(() => {
+    if (specFile && trafficFile) {
+      const result = analyzeApiContract(specFile.parsedContent, trafficFile.parsedContent);
+      result.specName = specFile.name;
+      setAnalysis(result);
+    }
+  }, [specFile, trafficFile]);
+
+  const hasData = analysis.specName !== null;
+
+  const handleFiles = (files) => {
+    Array.from(files).filter(f => /\.(yaml|yml|json|har)$/.test(f.name)).forEach(file => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const content = e.target.result;
+        let parsed = null;
+        try {
+          if (/\.(json|har)$/.test(file.name)) parsed = JSON.parse(content);
+          else parsed = parseYaml(content);
+        } catch { alert(`Error parsing ${file.name}`); return; }
+
+        const fileData = { name: file.name, parsedContent: parsed };
+        if (/\.(yaml|yml)$/.test(file.name) || parsed?.openapi || parsed?.swagger) setSpecFile(fileData);
+        else setTrafficFile(fileData);
+        if (onUpload) onUpload(fileData);
+      };
+      reader.readAsText(file);
+    });
+  };
+
+  const parseYaml = (str) => {
+    const result = {};
+    const stack = [{ obj: result, indent: -1 }];
+    for (let line of str.split('\n')) {
+      if (!line.trim() || line.trim().startsWith('#')) continue;
+      const indent = line.search(/\S/);
+      while (stack.length > 1 && stack[stack.length - 1].indent >= indent) stack.pop();
+      const parent = stack[stack.length - 1].obj;
+      if (line.includes(':')) {
+        const [k, ...v] = line.split(':');
+        const key = k.trim(), val = v.join(':').trim();
+        if (!val) { parent[key] = {}; stack.push({ obj: parent[key], indent }); }
+        else parent[key] = val === 'true' ? true : val === 'false' ? false : val.replace(/^["']|["']$/g, '');
+      }
+    }
+    return result;
+  };
+
+  const handleDrop = (e) => { e.preventDefault(); setUploadDrag(false); handleFiles(e.dataTransfer.files); };
+
+  const getColor = (risk) => ({ error: '#ff4d4d', warning: '#ffa64d', dead: '#555', info: '#555', ok: '#4dff88' }[risk] || '#4dffff');
+  const methodColor = (m) => ({ GET: '#4dff88', POST: '#4d88ff', PATCH: '#ffa64d', DELETE: '#ff4d4d', PUT: '#a64dff' }[m] || '#4dffff');
+
+  const healthScore = analysis.endpoints.length ? Math.round((analysis.endpoints.filter(e => e.risk === 'ok').length / analysis.endpoints.length) * 100) : 0;
+
+  // Combine all issues: mismatches + dead endpoints + deprecated endpoints
+  const allIssues = [
+    ...analysis.mismatches,
+    ...analysis.endpoints.filter(ep => ep.risk === 'dead').map(ep => ({
+      type: 'dead',
+      endpoint: `${ep.method} ${ep.path}`,
+      field: `${ep.method} ${ep.path}`,
+      frequency: '0 requests',
+      severity: 'dead'
+    })),
+    ...analysis.endpoints.filter(ep => ep.risk === 'warning').map(ep => ({
+      type: 'deprecated',
+      endpoint: `${ep.method} ${ep.path}`,
+      field: `${ep.method} ${ep.path}`,
+      frequency: `${ep.hits.toLocaleString()} requests`,
+      severity: 'warning'
+    }))
   ];
 
-  useEffect(() => {
-    const savedDarkMode = localStorage.getItem('darkMode') === 'true';
-    setDarkMode(savedDarkMode);
-  }, []);
+  // Sort issues: errors first, then warnings, then dead
+  const severityOrder = { error: 0, warning: 1, dead: 2 };
+  allIssues.sort((a, b) => (severityOrder[a.severity] ?? 3) - (severityOrder[b.severity] ?? 3));
 
-  useEffect(() => {
-    if (!user) return;
+  // Filter organization optimizer to only show safe-to-delete and deprecated items
+  const optimizerItems = analysis.breakingRisks.filter(r => 
+    r.severity === 'safe' || r.severity === 'deprecated'
+  );
 
-    const jobsQuery = query(
-      collection(db, 'jobs'),
-      where('userId', '==', user.uid)
-    );
-
-    const unsubscribe = onSnapshot(jobsQuery, (snapshot) => {
-      const jobsData = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      setJobs(jobsData);
-      console.log('Jobs loaded:', jobsData);
-    }, (error) => {
-      console.error('Error loading jobs:', error);
-    });
-
-    return () => unsubscribe();
-  }, [user]);
-
-  const toggleDarkMode = () => {
-    const newDarkMode = !darkMode;
-    setDarkMode(newDarkMode);
-    localStorage.setItem('darkMode', newDarkMode.toString());
-  };
-
-  const handleLogout = async () => {
-    try {
-      await signOut(auth);
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleDeleteAccount = async () => {
-    if (!window.confirm('Delete your account? This cannot be undone.')) return;
-    
-    try {
-      const currentUser = auth.currentUser;
-      if (currentUser) await currentUser.delete();
-    } catch (error) {
-      if (error.code === 'auth/requires-recent-login') {
-        alert('Please log out and log back in before deleting your account.');
-      } else {
-        alert('Error deleting account. Please try again.');
-      }
-    }
-  };
-
-  const addJob = async () => {
-    console.log('Add job clicked');
-    console.log('Current newJob state:', newJob);
-    console.log('User:', user);
-
-    if (!newJob.companyName.trim()) {
-      alert('Please enter a company name');
-      return;
-    }
-    if (!newJob.role.trim()) {
-      alert('Please enter a role');
-      return;
-    }
-
-    setAddingJob(true);
-
-    try {
-      const jobData = {
-        companyName: newJob.companyName,
-        role: newJob.role,
-        applyDate: newJob.applyDate,
-        status: newJob.status,
-        userId: user.uid,
-        createdAt: new Date()
-      };
-
-      console.log('Attempting to add job with data:', jobData);
-
-      const docRef = await addDoc(collection(db, 'jobs'), jobData);
-
-      console.log('Job added successfully with ID:', docRef.id);
-
-      setNewJob({
-        companyName: '',
-        role: '',
-        applyDate: new Date().toISOString().split('T')[0],
-        status: 'Applied'
-      });
-      setShowAddModal(false);
-    } catch (error) {
-      console.error('Error adding job:', error);
-      alert('Error adding job: ' + error.message);
-    } finally {
-      setAddingJob(false);
-    }
-  };
-
-  const updateJob = async (jobId, field, value) => {
-    try {
-      await updateDoc(doc(db, 'jobs', jobId), { [field]: value });
-      console.log('Job updated successfully');
-    } catch (error) {
-      console.error('Error updating job:', error);
-      alert('Error updating job: ' + error.message);
-    }
-  };
-
-  const deleteJob = async (jobId) => {
-    if (!window.confirm('Delete this job?')) return;
-    try {
-      await deleteDoc(doc(db, 'jobs', jobId));
-      console.log('Job deleted successfully');
-    } catch (error) {
-      console.error('Error deleting job:', error);
-      alert('Error deleting job: ' + error.message);
-    }
-  };
-
-  const filterJobsByDate = (jobs, dateRange) => {
-    if (!dateRange.start && !dateRange.end) return jobs;
-    
-    return jobs.filter(job => {
-      const jobDate = new Date(job.applyDate);
-      if (dateRange.start && jobDate < new Date(dateRange.start)) return false;
-      if (dateRange.end && jobDate > new Date(dateRange.end)) return false;
-      return true;
-    });
-  };
-
-  const leftFilteredJobs = filterJobsByDate(jobs, leftDateRange);
-  const rightFilteredJobs = filterJobsByDate(jobs, rightDateRange);
-
-  const calculateAnalytics = () => {
-    const total = rightFilteredJobs.length;
-    if (total === 0) return [];
-
-    // Calculate cumulative counts - jobs count towards their current stage AND all previous stages
-    const getCumulativeCount = (stage) => {
-      const stageIndex = STATUS_OPTIONS.indexOf(stage);
-      return rightFilteredJobs.filter(job => {
-        const jobStageIndex = STATUS_OPTIONS.indexOf(job.status);
-        return jobStageIndex >= stageIndex; // Job is at this stage or beyond
-      }).length;
-    };
-
-    const cumulativeCounts = STATUS_OPTIONS.map(status => getCumulativeCount(status));
-
-    return [
-      {
-        stage: 'Applied',
-        count: cumulativeCounts[0],
-        percentOfTotal: 100,
-        percentOfPrevious: '-'
-      },
-      {
-        stage: 'First next step',
-        count: cumulativeCounts[1],
-        percentOfTotal: total > 0 ? ((cumulativeCounts[1] / total) * 100).toFixed(1) : 0,
-        percentOfPrevious: cumulativeCounts[0] > 0 ? ((cumulativeCounts[1] / cumulativeCounts[0]) * 100).toFixed(1) : 0
-      },
-      {
-        stage: 'Passed next step',
-        count: cumulativeCounts[2],
-        percentOfTotal: total > 0 ? ((cumulativeCounts[2] / total) * 100).toFixed(1) : 0,
-        percentOfPrevious: cumulativeCounts[1] > 0 ? ((cumulativeCounts[2] / cumulativeCounts[1]) * 100).toFixed(1) : 0
-      },
-      {
-        stage: 'Interview',
-        count: cumulativeCounts[3],
-        percentOfTotal: total > 0 ? ((cumulativeCounts[3] / total) * 100).toFixed(1) : 0,
-        percentOfPrevious: cumulativeCounts[2] > 0 ? ((cumulativeCounts[3] / cumulativeCounts[2]) * 100).toFixed(1) : 0
-      },
-      {
-        stage: 'Offer received',
-        count: cumulativeCounts[4],
-        percentOfTotal: total > 0 ? ((cumulativeCounts[4] / total) * 100).toFixed(1) : 0,
-        percentOfPrevious: cumulativeCounts[3] > 0 ? ((cumulativeCounts[4] / cumulativeCounts[3]) * 100).toFixed(1) : 0
-      }
-    ];
-  };
-
-  const analytics = calculateAnalytics();
-  const maxCount = Math.max(...analytics.map(a => a.count), 1);
+  // Sort optimizer: Field first, then Endpoint; within each by safe (can be deleted) then deprecated
+  const actionOrder = { Field: 0, Endpoint: 1 };
+  const optSeverityOrder = { safe: 0, deprecated: 1 };
+  optimizerItems.sort((a, b) => {
+    const actionDiff = (actionOrder[a.action] ?? 2) - (actionOrder[b.action] ?? 2);
+    if (actionDiff !== 0) return actionDiff;
+    return (optSeverityOrder[a.severity] ?? 2) - (optSeverityOrder[b.severity] ?? 2);
+  });
 
   return (
-    <>
-      <style>{`
-        @keyframes spin {
-          0% { transform: rotate(0deg); }
-          100% { transform: rotate(360deg); }
-        }
-        * { box-sizing: border-box; }
-        
-        /* Custom scrollbar styling */
-        .scroll-container {
-          background: transparent !important;
-        }
-        .scroll-container::-webkit-scrollbar {
-          width: 8px;
-        }
-        .scroll-container::-webkit-scrollbar-track {
-          background: transparent;
-        }
-        .scroll-container::-webkit-scrollbar-thumb {
-          background: ${darkMode ? 'rgba(255, 255, 255, 0.2)' : 'rgba(0, 0, 0, 0.2)'};
-          border-radius: 4px;
-        }
-        .scroll-container::-webkit-scrollbar-thumb:hover {
-          background: ${darkMode ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.3)'};
-        }
-      `}</style>
+    <div style={styles.container}>
+      <div style={styles.grid} />
+      <input ref={fileInputRef} type="file" multiple accept=".yaml,.yml,.json,.har" hidden onChange={(e) => handleFiles(e.target.files)} />
+      
+      <header style={styles.header}>
+        <div style={styles.logo}>
+          <span style={styles.title}>API INTEL</span>
+        </div>
+        {hasData && <span style={styles.badge}>◈ {analysis.specName}</span>}
+      </header>
 
-      <div style={{
-        minHeight: '100vh',
-        background: darkMode ? '#1a1a1a' : '#f5f5f5',
-        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif'
-      }}>
-        {/* Header */}
-        <header style={{
-          background: darkMode ? '#2d2d2d' : 'white',
-          padding: '16px 24px',
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
-          position: 'sticky',
-          top: 0,
-          zIndex: 100
-        }}>
-          <div style={{
-            fontSize: '20px',
-            fontWeight: '700',
-            color: darkMode ? '#fff' : '#333',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '12px'
-          }}>
-            Application Tracker
-          </div>
-          
-          <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-            <button
-              onClick={() => setShowSettings(true)}
-              style={{
-                width: '36px',
-                height: '36px',
-                borderRadius: '8px',
-                background: darkMode ? '#3d3d3d' : '#f0f0f0',
-                border: 'none',
-                cursor: 'pointer',
-                fontSize: '18px'
-              }}
-            >
-              ⚙️
-            </button>
-            <button
-              onClick={handleLogout}
-              style={{
-                padding: '8px 16px',
-                background: '#667eea',
-                color: 'white',
-                border: 'none',
-                borderRadius: '6px',
-                cursor: 'pointer',
-                fontWeight: '600'
-              }}
-            >
-              Logout
-            </button>
-          </div>
-        </header>
-
-        {/* Main Content - Split Layout */}
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: '1fr 1fr',
-          gap: '20px',
-          padding: '20px',
-          height: 'calc(100vh - 80px)'
-        }}>
-          {/* LEFT SIDE - Jobs Table */}
-          <div style={{
-            background: darkMode ? '#2d2d2d' : 'white',
-            borderRadius: '12px',
-            padding: '20px 10px 20px 20px',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-            display: 'flex',
-            flexDirection: 'column',
-            height: '100%',
-            overflow: 'hidden'
-          }}>
-            <div style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              marginBottom: '20px',
-              flexShrink: 0,
-              paddingRight: '10px'
-            }}>
-              <div style={{
-                fontSize: '18px',
-                fontWeight: '600',
-                color: darkMode ? '#fff' : '#333'
-              }}>
-                Jobs
-              </div>
-              <div style={{ display: 'flex', gap: '8px' }}>
-                <button
-                  onClick={() => {
-                    console.log('Add button clicked');
-                    setShowAddModal(true);
-                  }}
-                  style={{
-                    width: '36px',
-                    height: '36px',
-                    borderRadius: '8px',
-                    background: darkMode ? '#3d3d3d' : '#f0f0f0',
-                    border: 'none',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    fontSize: '24px',
-                    fontWeight: 'bold',
-                    color: darkMode ? '#fff' : '#333'
-                  }}
-                >
-                  +
-                </button>
-                <button
-                  onClick={() => setShowLeftFilter(true)}
-                  style={{
-                    width: '36px',
-                    height: '36px',
-                    borderRadius: '8px',
-                    background: darkMode ? '#3d3d3d' : '#f0f0f0',
-                    border: 'none',
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center'
-                  }}
-                >
-                  <Filter size={18} color={darkMode ? '#fff' : '#333'} />
-                </button>
-              </div>
+      {!hasData ? (
+        <div style={styles.empty}>
+          <svg width="56" height="56" viewBox="0 0 80 80" fill="none" style={{ opacity: 0.4, marginBottom: 16 }}>
+            <rect x="8" y="16" width="64" height="48" rx="2" stroke="#4dffff" strokeWidth="1.5" strokeDasharray="4 2" />
+            <path d="M40 28v24M28 40l12-12 12 12" stroke="#4dffff" strokeWidth="1.5" />
+          </svg>
+          <h2 style={styles.emptyTitle}>Upload Files to Analyze</h2>
+          <div style={styles.fileChecks}>
+            <div style={{...styles.fileCheck, borderColor: specFile ? '#4dff88' : '#333'}}>
+              <span style={{ color: specFile ? '#4dff88' : '#555' }}>{specFile ? '✓' : '1'}</span>
+              <span>OpenAPI Spec</span>
             </div>
-
-            <div 
-              className="scroll-container"
-              style={{ 
-                flex: 1, 
-                overflowY: 'auto',
-                overflowX: 'hidden',
-                background: 'transparent',
-                paddingRight: '10px'
-              }}
-            >
-              {leftFilteredJobs.length === 0 ? (
-                <div style={{
-                  textAlign: 'center',
-                  padding: '40px',
-                  color: darkMode ? '#666' : '#999'
-                }}>
-                  No jobs yet. Click + to add one!
-                </div>
-              ) : (
-                <table style={{
-                  width: '100%',
-                  borderCollapse: 'collapse',
-                  fontSize: '14px',
-                  tableLayout: 'fixed'
-                }}>
-                  <thead>
-                    <tr>
-                      <th style={{
-                        textAlign: 'left',
-                        padding: '12px 8px',
-                        borderBottom: darkMode ? '2px solid #3d3d3d' : '2px solid #e0e0e0',
-                        color: darkMode ? '#aaa' : '#666',
-                        fontWeight: '600',
-                        fontSize: '12px',
-                        textTransform: 'uppercase',
-                        width: '22%'
-                      }}>Company name</th>
-                      <th style={{
-                        textAlign: 'left',
-                        padding: '12px 8px',
-                        borderBottom: darkMode ? '2px solid #3d3d3d' : '2px solid #e0e0e0',
-                        color: darkMode ? '#aaa' : '#666',
-                        fontWeight: '600',
-                        fontSize: '12px',
-                        textTransform: 'uppercase',
-                        width: '22%'
-                      }}>Role</th>
-                      <th style={{
-                        textAlign: 'left',
-                        padding: '12px 8px',
-                        borderBottom: darkMode ? '2px solid #3d3d3d' : '2px solid #e0e0e0',
-                        color: darkMode ? '#aaa' : '#666',
-                        fontWeight: '600',
-                        fontSize: '12px',
-                        textTransform: 'uppercase',
-                        width: '20%'
-                      }}>Apply date</th>
-                      <th style={{
-                        textAlign: 'left',
-                        padding: '12px 8px',
-                        borderBottom: darkMode ? '2px solid #3d3d3d' : '2px solid #e0e0e0',
-                        color: darkMode ? '#aaa' : '#666',
-                        fontWeight: '600',
-                        fontSize: '12px',
-                        textTransform: 'uppercase',
-                        width: '22.85%'
-                      }}>Status</th>
-                      <th style={{
-                        textAlign: 'left',
-                        padding: '12px 8px',
-                        borderBottom: darkMode ? '2px solid #3d3d3d' : '2px solid #e0e0e0',
-                        width: '11%'
-                      }}></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {leftFilteredJobs.map(job => (
-                      <tr key={job.id}>
-                        <td style={{
-                          padding: '12px 8px',
-                          borderBottom: darkMode ? '1px solid #3d3d3d' : '1px solid #f0f0f0',
-                          color: darkMode ? '#fff' : '#333'
-                        }}>
-                          <input
-                            type="text"
-                            value={job.companyName}
-                            onChange={(e) => updateJob(job.id, 'companyName', e.target.value)}
-                            style={{
-                              width: '100%',
-                              padding: '8px',
-                              border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                              borderRadius: '4px',
-                              background: darkMode ? '#1a1a1a' : 'white',
-                              color: darkMode ? '#fff' : '#333',
-                              fontSize: '14px'
-                            }}
-                          />
-                        </td>
-                        <td style={{
-                          padding: '12px 8px',
-                          borderBottom: darkMode ? '1px solid #3d3d3d' : '1px solid #f0f0f0'
-                        }}>
-                          <input
-                            type="text"
-                            value={job.role}
-                            onChange={(e) => updateJob(job.id, 'role', e.target.value)}
-                            style={{
-                              width: '100%',
-                              padding: '8px',
-                              border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                              borderRadius: '4px',
-                              background: darkMode ? '#1a1a1a' : 'white',
-                              color: darkMode ? '#fff' : '#333',
-                              fontSize: '14px'
-                            }}
-                          />
-                        </td>
-                        <td style={{
-                          padding: '12px 8px',
-                          borderBottom: darkMode ? '1px solid #3d3d3d' : '1px solid #f0f0f0'
-                        }}>
-                          <input
-                            type="date"
-                            value={job.applyDate}
-                            onChange={(e) => updateJob(job.id, 'applyDate', e.target.value)}
-                            style={{
-                              width: '100%',
-                              padding: '8px',
-                              border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                              borderRadius: '4px',
-                              background: darkMode ? '#1a1a1a' : 'white',
-                              color: darkMode ? '#fff' : '#333',
-                              fontSize: '14px'
-                            }}
-                          />
-                        </td>
-                        <td style={{
-                          padding: '12px 8px',
-                          borderBottom: darkMode ? '1px solid #3d3d3d' : '1px solid #f0f0f0'
-                        }}>
-                          <select
-                            value={job.status}
-                            onChange={(e) => updateJob(job.id, 'status', e.target.value)}
-                            style={{
-                              width: '100%',
-                              padding: '8px',
-                              border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                              borderRadius: '4px',
-                              background: darkMode ? '#1a1a1a' : 'white',
-                              color: darkMode ? '#fff' : '#333',
-                              fontSize: '14px',
-                              cursor: 'pointer'
-                            }}
-                          >
-                            {STATUS_OPTIONS.map(status => (
-                              <option key={status} value={status}>{status}</option>
-                            ))}
-                          </select>
-                        </td>
-                        <td style={{
-                          padding: '12px 8px',
-                          borderBottom: darkMode ? '1px solid #3d3d3d' : '1px solid #f0f0f0'
-                        }}>
-                          <button
-                            onClick={() => deleteJob(job.id)}
-                            style={{
-                              padding: '6px 10px',
-                              background: '#ef4444',
-                              color: 'white',
-                              border: 'none',
-                              borderRadius: '4px',
-                              cursor: 'pointer',
-                              fontSize: '12px',
-                              width: '100%',
-                              whiteSpace: 'nowrap'
-                            }}
-                          >
-                            Delete
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+            <div style={{...styles.fileCheck, borderColor: trafficFile ? '#4dff88' : '#333'}}>
+              <span style={{ color: trafficFile ? '#4dff88' : '#555' }}>{trafficFile ? '✓' : '2'}</span>
+              <span>Traffic Data</span>
             </div>
           </div>
-
-          {/* RIGHT SIDE - Analytics */}
-          <div style={{
-            background: darkMode ? '#2d2d2d' : 'white',
-            borderRadius: '12px',
-            padding: '20px',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-            display: 'flex',
-            flexDirection: 'column',
-            overflow: 'auto'
-          }}>
-            <div style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              marginBottom: '20px'
-            }}>
-              <div style={{
-                fontSize: '18px',
-                fontWeight: '600',
-                color: darkMode ? '#fff' : '#333'
-              }}>
-                Insights
-              </div>
-              <button
-                onClick={() => setShowRightFilter(true)}
-                style={{
-                  width: '36px',
-                  height: '36px',
-                  borderRadius: '8px',
-                  background: darkMode ? '#3d3d3d' : '#f0f0f0',
-                  border: 'none',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center'
-                }}
-              >
-                <Filter size={18} color={darkMode ? '#fff' : '#333'} />
-              </button>
-            </div>
-
-            {/* Bar Chart */}
-            <div style={{ marginBottom: '30px' }}>
-              <div style={{
-                display: 'flex',
-                alignItems: 'flex-end',
-                justifyContent: 'space-around',
-                height: '200px',
-                marginBottom: '10px'
-              }}>
-                {analytics.map((item, idx) => {
-                  // Calculate height: 
-                  // - If count is 0, height is 0 (no bar)
-                  // - If count is 1, use minimum height of 30px
-                  // - If count > 1, scale proportionally with minimum of 30px
-                  let barHeight = 0;
-                  if (item.count === 0) {
-                    barHeight = 0;
-                  } else if (item.count === 1) {
-                    barHeight = 30;
-                  } else {
-                    barHeight = Math.max(30, (item.count / maxCount) * 170);
-                  }
-                  
-                  return (
-                    <div key={idx} style={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      alignItems: 'center',
-                      flex: 1,
-                      maxWidth: '80px'
-                    }}>
-                      {item.count > 0 && (
-                        <div style={{
-                          width: '100%',
-                          background: '#667eea',
-                          borderRadius: '4px 4px 0 0',
-                          display: 'flex',
-                          alignItems: 'flex-start',
-                          justifyContent: 'center',
-                          paddingTop: '8px',
-                          color: 'white',
-                          fontWeight: '600',
-                          fontSize: '14px',
-                          height: `${barHeight}px`
-                        }}>
-                          {item.count}
-                        </div>
-                      )}
-                      {item.count === 0 && (
-                        <div style={{
-                          width: '100%',
-                          color: darkMode ? '#666' : '#999',
-                          fontWeight: '600',
-                          fontSize: '14px',
-                          textAlign: 'center',
-                          marginBottom: '4px'
-                        }}>
-                          0
-                        </div>
-                      )}
-                      <div style={{
-                        marginTop: '8px',
-                        fontSize: '10px',
-                        color: darkMode ? '#aaa' : '#666',
-                        textAlign: 'center',
-                        lineHeight: '1.2',
-                        wordWrap: 'break-word'
-                      }}>
-                        {item.stage}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Analytics Table */}
-            <div style={{ flex: 1, overflowY: 'auto' }}>
-              <table style={{
-                width: '100%',
-                borderCollapse: 'collapse',
-                fontSize: '13px'
-              }}>
-                <thead>
-                  <tr>
-                    <th style={{
-                      textAlign: 'left',
-                      padding: '12px 8px',
-                      borderBottom: darkMode ? '2px solid #3d3d3d' : '2px solid #e0e0e0',
-                      color: darkMode ? '#aaa' : '#666',
-                      fontWeight: '600',
-                      fontSize: '11px',
-                      textTransform: 'uppercase'
-                    }}></th>
-                    <th style={{
-                      textAlign: 'left',
-                      padding: '12px 8px',
-                      borderBottom: darkMode ? '2px solid #3d3d3d' : '2px solid #e0e0e0',
-                      color: darkMode ? '#aaa' : '#666',
-                      fontWeight: '600',
-                      fontSize: '11px',
-                      textTransform: 'uppercase'
-                    }}>Number of jobs</th>
-                    <th style={{
-                      textAlign: 'left',
-                      padding: '12px 8px',
-                      borderBottom: darkMode ? '2px solid #3d3d3d' : '2px solid #e0e0e0',
-                      color: darkMode ? '#aaa' : '#666',
-                      fontWeight: '600',
-                      fontSize: '11px',
-                      textTransform: 'uppercase'
-                    }}>percentage out of jobs applied</th>
-                    <th style={{
-                      textAlign: 'left',
-                      padding: '12px 8px',
-                      borderBottom: darkMode ? '2px solid #3d3d3d' : '2px solid #e0e0e0',
-                      color: darkMode ? '#aaa' : '#666',
-                      fontWeight: '600',
-                      fontSize: '11px',
-                      textTransform: 'uppercase'
-                    }}>percentage out of previous stage</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {analytics.map((item, idx) => (
-                    <tr key={idx}>
-                      <td style={{
-                        padding: '12px 8px',
-                        borderBottom: darkMode ? '1px solid #3d3d3d' : '1px solid #f0f0f0',
-                        color: darkMode ? '#fff' : '#333'
-                      }}>{item.stage}</td>
-                      <td style={{
-                        padding: '12px 8px',
-                        borderBottom: darkMode ? '1px solid #3d3d3d' : '1px solid #f0f0f0',
-                        color: darkMode ? '#fff' : '#333'
-                      }}>{item.count}</td>
-                      <td style={{
-                        padding: '12px 8px',
-                        borderBottom: darkMode ? '1px solid #3d3d3d' : '1px solid #f0f0f0',
-                        color: darkMode ? '#fff' : '#333'
-                      }}>{item.percentOfTotal}%</td>
-                      <td style={{
-                        padding: '12px 8px',
-                        borderBottom: darkMode ? '1px solid #3d3d3d' : '1px solid #f0f0f0',
-                        color: darkMode ? '#fff' : '#333'
-                      }}>{typeof item.percentOfPrevious === 'number' ? `${item.percentOfPrevious}%` : item.percentOfPrevious}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+          <div 
+            style={{...styles.dropzone, ...(uploadDrag ? styles.dropzoneActive : {})}}
+            onDragOver={(e) => { e.preventDefault(); setUploadDrag(true); }}
+            onDragLeave={() => setUploadDrag(false)}
+            onDrop={handleDrop}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            Drop files or click to browse
           </div>
         </div>
-
-        {/* Add Job Modal */}
-        {showAddModal && (
-          <div
-            onClick={() => setShowAddModal(false)}
-            style={{
-              position: 'fixed',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              background: 'rgba(0,0,0,0.5)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              zIndex: 1000
-            }}
-          >
-            <div
-              onClick={(e) => e.stopPropagation()}
-              style={{
-                background: darkMode ? '#2d2d2d' : 'white',
-                borderRadius: '12px',
-                padding: '24px',
-                width: '90%',
-                maxWidth: '500px'
-              }}
-            >
-              <h2 style={{
-                fontSize: '20px',
-                fontWeight: '700',
-                marginBottom: '20px',
-                color: darkMode ? '#fff' : '#333'
-              }}>Add Job Application</h2>
-
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{
-                  display: 'block',
-                  fontSize: '14px',
-                  fontWeight: '600',
-                  marginBottom: '8px',
-                  color: darkMode ? '#aaa' : '#666'
-                }}>Company Name</label>
-                <input
-                  type="text"
-                  value={newJob.companyName}
-                  onChange={(e) => setNewJob({ ...newJob, companyName: e.target.value })}
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    background: darkMode ? '#1a1a1a' : 'white',
-                    color: darkMode ? '#fff' : '#333'
-                  }}
-                  autoFocus
-                />
-              </div>
-
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{
-                  display: 'block',
-                  fontSize: '14px',
-                  fontWeight: '600',
-                  marginBottom: '8px',
-                  color: darkMode ? '#aaa' : '#666'
-                }}>Role</label>
-                <input
-                  type="text"
-                  value={newJob.role}
-                  onChange={(e) => setNewJob({ ...newJob, role: e.target.value })}
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    background: darkMode ? '#1a1a1a' : 'white',
-                    color: darkMode ? '#fff' : '#333'
-                  }}
-                />
-              </div>
-
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{
-                  display: 'block',
-                  fontSize: '14px',
-                  fontWeight: '600',
-                  marginBottom: '8px',
-                  color: darkMode ? '#aaa' : '#666'
-                }}>Apply Date</label>
-                <input
-                  type="date"
-                  value={newJob.applyDate}
-                  onChange={(e) => setNewJob({ ...newJob, applyDate: e.target.value })}
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    background: darkMode ? '#1a1a1a' : 'white',
-                    color: darkMode ? '#fff' : '#333'
-                  }}
-                />
-              </div>
-
-              <div style={{ marginBottom: '20px' }}>
-                <label style={{
-                  display: 'block',
-                  fontSize: '14px',
-                  fontWeight: '600',
-                  marginBottom: '8px',
-                  color: darkMode ? '#aaa' : '#666'
-                }}>Status</label>
-                <select
-                  value={newJob.status}
-                  onChange={(e) => setNewJob({ ...newJob, status: e.target.value })}
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    background: darkMode ? '#1a1a1a' : 'white',
-                    color: darkMode ? '#fff' : '#333',
-                    cursor: 'pointer'
-                  }}
-                >
-                  {STATUS_OPTIONS.map(status => (
-                    <option key={status} value={status}>{status}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div style={{ display: 'flex', gap: '12px' }}>
-                <button
-                  onClick={() => {
-                    setShowAddModal(false);
-                    setNewJob({
-                      companyName: '',
-                      role: '',
-                      applyDate: new Date().toISOString().split('T')[0],
-                      status: 'Applied'
-                    });
-                  }}
-                  style={{
-                    flex: 1,
-                    padding: '12px',
-                    background: darkMode ? '#3d3d3d' : '#f0f0f0',
-                    color: darkMode ? '#fff' : '#666',
-                    border: 'none',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    fontWeight: '600',
-                    cursor: 'pointer'
-                  }}
-                  disabled={addingJob}
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={addJob}
-                  style={{
-                    flex: 1,
-                    padding: '12px',
-                    background: addingJob ? '#999' : '#667eea',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    fontWeight: '600',
-                    cursor: addingJob ? 'not-allowed' : 'pointer'
-                  }}
-                  disabled={addingJob}
-                >
-                  {addingJob ? 'Adding...' : 'Add'}
-                </button>
-              </div>
+      ) : (
+        <main style={styles.main}>
+          {/* Health */}
+          <div style={styles.health}>
+            <div style={styles.ring}>
+              <svg width="100" height="100" viewBox="0 0 100 100">
+                <circle cx="50" cy="50" r="44" fill="none" stroke="#1a1f2e" strokeWidth="6" />
+                <circle cx="50" cy="50" r="44" fill="none" stroke={healthScore > 70 ? '#4dff88' : '#ffa64d'} strokeWidth="6" strokeDasharray={`${healthScore * 2.76} 276`} strokeLinecap="round" transform="rotate(-90 50 50)" />
+              </svg>
+              <span style={styles.ringVal}>{healthScore}%</span>
+            </div>
+            <div>
+              <div style={styles.healthLabel}>Contract Health</div>
+              <div style={styles.healthMeta}>{analysis.totalEndpoints} endpoints · {analysis.trafficSamples.toLocaleString()} requests · {allIssues.length} issues</div>
             </div>
           </div>
-        )}
 
-        {/* Left Filter Modal */}
-        {showLeftFilter && (
-          <div
-            onClick={() => setShowLeftFilter(false)}
-            style={{
-              position: 'fixed',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              background: 'rgba(0,0,0,0.5)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              zIndex: 1000
-            }}
-          >
-            <div
-              onClick={(e) => e.stopPropagation()}
-              style={{
-                background: darkMode ? '#2d2d2d' : 'white',
-                borderRadius: '12px',
-                padding: '24px',
-                width: '90%',
-                maxWidth: '400px'
-              }}
-            >
-              <h2 style={{
-                fontSize: '20px',
-                fontWeight: '700',
-                marginBottom: '20px',
-                color: darkMode ? '#fff' : '#333'
-              }}>Filter Jobs by Date</h2>
-
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{
-                  display: 'block',
-                  fontSize: '14px',
-                  fontWeight: '600',
-                  marginBottom: '8px',
-                  color: darkMode ? '#aaa' : '#666'
-                }}>Start Date</label>
-                <input
-                  type="date"
-                  value={leftDateRange.start}
-                  onChange={(e) => setLeftDateRange({ ...leftDateRange, start: e.target.value })}
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    background: darkMode ? '#1a1a1a' : 'white',
-                    color: darkMode ? '#fff' : '#333'
-                  }}
-                />
-              </div>
-
-              <div style={{ marginBottom: '20px' }}>
-                <label style={{
-                  display: 'block',
-                  fontSize: '14px',
-                  fontWeight: '600',
-                  marginBottom: '8px',
-                  color: darkMode ? '#aaa' : '#666'
-                }}>End Date</label>
-                <input
-                  type="date"
-                  value={leftDateRange.end}
-                  onChange={(e) => setLeftDateRange({ ...leftDateRange, end: e.target.value })}
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    background: darkMode ? '#1a1a1a' : 'white',
-                    color: darkMode ? '#fff' : '#333'
-                  }}
-                />
-              </div>
-
-              <div style={{ display: 'flex', gap: '12px' }}>
-                <button
-                  onClick={() => setLeftDateRange({ start: '', end: '' })}
-                  style={{
-                    flex: 1,
-                    padding: '12px',
-                    background: darkMode ? '#3d3d3d' : '#f0f0f0',
-                    color: darkMode ? '#fff' : '#666',
-                    border: 'none',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    fontWeight: '600',
-                    cursor: 'pointer'
-                  }}
-                >
-                  Clear
-                </button>
-                <button
-                  onClick={() => setShowLeftFilter(false)}
-                  style={{
-                    flex: 1,
-                    padding: '12px',
-                    background: '#667eea',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    fontWeight: '600',
-                    cursor: 'pointer'
-                  }}
-                >
-                  Apply
-                </button>
-              </div>
-            </div>
+          {/* Stats */}
+          <div style={styles.stats}>
+            <div style={styles.stat}><span style={{...styles.statNum, color: '#4dff88'}}>{analysis.endpoints.filter(e => e.risk === 'ok').length}</span><span style={styles.statLbl}>Healthy</span></div>
+            <div style={styles.stat}><span style={{...styles.statNum, color: '#555'}}>{analysis.endpoints.filter(e => e.risk === 'dead').length}</span><span style={styles.statLbl}>Dead</span></div>
+            <div style={styles.stat}><span style={{...styles.statNum, color: '#ffa64d'}}>{allIssues.filter(m => m.severity === 'warning').length}</span><span style={styles.statLbl}>Warnings</span></div>
+            <div style={styles.stat}><span style={{...styles.statNum, color: '#ff4d4d'}}>{allIssues.filter(m => m.severity === 'error').length}</span><span style={styles.statLbl}>Errors</span></div>
           </div>
-        )}
 
-        {/* Right Filter Modal */}
-        {showRightFilter && (
-          <div
-            onClick={() => setShowRightFilter(false)}
-            style={{
-              position: 'fixed',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              background: 'rgba(0,0,0,0.5)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              zIndex: 1000
-            }}
-          >
-            <div
-              onClick={(e) => e.stopPropagation()}
-              style={{
-                background: darkMode ? '#2d2d2d' : 'white',
-                borderRadius: '12px',
-                padding: '24px',
-                width: '90%',
-                maxWidth: '400px'
-              }}
-            >
-              <h2 style={{
-                fontSize: '20px',
-                fontWeight: '700',
-                marginBottom: '20px',
-                color: darkMode ? '#fff' : '#333'
-              }}>Filter Analytics by Date</h2>
-
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{
-                  display: 'block',
-                  fontSize: '14px',
-                  fontWeight: '600',
-                  marginBottom: '8px',
-                  color: darkMode ? '#aaa' : '#666'
-                }}>Start Date</label>
-                <input
-                  type="date"
-                  value={rightDateRange.start}
-                  onChange={(e) => setRightDateRange({ ...rightDateRange, start: e.target.value })}
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    background: darkMode ? '#1a1a1a' : 'white',
-                    color: darkMode ? '#fff' : '#333'
-                  }}
-                />
+          {/* Issues - Now includes dead, warnings, and errors */}
+          {allIssues.length > 0 && (
+            <section>
+              <h3 style={styles.section}>Issues</h3>
+              <div style={styles.issues}>
+                {allIssues.map((m, i) => (
+                  <div key={i} style={{...styles.issue, borderLeftColor: getColor(m.severity)}}>
+                    <div style={{...styles.issueType, color: getColor(m.severity)}}>
+                      {m.type === 'extra' && 'Undocumented Field'}
+                      {m.type === 'unused' && 'Never Used'}
+                      {m.type === 'type' && 'Type Mismatch'}
+                      {m.type === 'dead' && 'Dead Endpoint'}
+                      {m.type === 'deprecated' && 'Deprecated'}
+                    </div>
+                    <div style={styles.issueField}>{m.field}</div>
+                    <div style={styles.issueDesc}>
+                      {m.type === 'extra' && 'In traffic but missing from spec'}
+                      {m.type === 'unused' && 'In spec but never sent by clients'}
+                      {m.type === 'type' && <>Expected <span style={{color: '#4dff88'}}>{m.expected}</span> → Got <span style={{color: '#ff4d4d'}}>{m.actual}</span> ({m.frequency})</>}
+                      {m.type === 'dead' && 'No traffic received — candidate for removal'}
+                      {m.type === 'deprecated' && `Still receiving ${m.frequency}`}
+                    </div>
+                    <div style={styles.issueMeta}>{m.endpoint}</div>
+                  </div>
+                ))}
               </div>
+            </section>
+          )}
 
-              <div style={{ marginBottom: '20px' }}>
-                <label style={{
-                  display: 'block',
-                  fontSize: '14px',
-                  fontWeight: '600',
-                  marginBottom: '8px',
-                  color: darkMode ? '#aaa' : '#666'
-                }}>End Date</label>
-                <input
-                  type="date"
-                  value={rightDateRange.end}
-                  onChange={(e) => setRightDateRange({ ...rightDateRange, end: e.target.value })}
-                  style={{
-                    width: '100%',
-                    padding: '12px',
-                    border: darkMode ? '1px solid #444' : '1px solid #ddd',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    background: darkMode ? '#1a1a1a' : 'white',
-                    color: darkMode ? '#fff' : '#333'
-                  }}
-                />
+          {/* Organization Optimizer - Only safe-to-delete (red) and deprecated (orange) */}
+          {optimizerItems.length > 0 && (
+            <section>
+              <h3 style={styles.section}>Organization Optimizer</h3>
+              <div style={styles.risks}>
+                {optimizerItems.map((r, i) => (
+                  <div key={i} style={{
+                    ...styles.riskRow, 
+                    borderLeftColor: r.severity === 'safe' ? '#ff4d4d' : '#ffa64d'
+                  }}>
+                    <div style={styles.riskAction}>{r.action.toUpperCase()}</div>
+                    <div style={styles.riskTarget}>{r.target}</div>
+                    <div style={{
+                      ...styles.riskImpact, 
+                      color: r.severity === 'safe' ? '#ff4d4d' : '#ffa64d'
+                    }}>
+                      {r.severity === 'safe' ? '⊘ Can be deleted' : '⚠ Deprecated'}
+                    </div>
+                  </div>
+                ))}
               </div>
+            </section>
+          )}
 
-              <div style={{ display: 'flex', gap: '12px' }}>
-                <button
-                  onClick={() => setRightDateRange({ start: '', end: '' })}
-                  style={{
-                    flex: 1,
-                    padding: '12px',
-                    background: darkMode ? '#3d3d3d' : '#f0f0f0',
-                    color: darkMode ? '#fff' : '#666',
-                    border: 'none',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    fontWeight: '600',
-                    cursor: 'pointer'
-                  }}
-                >
-                  Clear
-                </button>
-                <button
-                  onClick={() => setShowRightFilter(false)}
-                  style={{
-                    flex: 1,
-                    padding: '12px',
-                    background: '#667eea',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '8px',
-                    fontSize: '16px',
-                    fontWeight: '600',
-                    cursor: 'pointer'
-                  }}
-                >
-                  Apply
-                </button>
+          {/* Field Usage */}
+          {analysis.fieldUsage.length > 0 && (
+            <section>
+              <h3 style={styles.section}>Field Usage</h3>
+              <div style={styles.usage}>
+                {analysis.fieldUsage.map((f, i) => (
+                  <div key={i} style={styles.usageRow}>
+                    <span style={styles.usageField}>{f.field}</span>
+                    <div style={styles.usageBarWrap}>
+                      <div style={{...styles.usageBar, width: `${f.usage}%`, background: f.usage < 5 ? '#555' : f.usage < 30 ? '#ffa64d' : '#4dff88'}} />
+                    </div>
+                    <span style={styles.usagePct}>{f.usage}%</span>
+                  </div>
+                ))}
               </div>
+            </section>
+          )}
+
+          {/* Endpoints */}
+          <section>
+            <h3 style={styles.section}>Endpoints</h3>
+            <div style={styles.endpoints}>
+              {analysis.endpoints.map((ep, i) => (
+                <div key={i} style={styles.ep}>
+                  <span style={{...styles.method, background: methodColor(ep.method)}}>{ep.method}</span>
+                  <span style={styles.path}>{ep.path}</span>
+                  <span style={styles.hits}>{ep.hits.toLocaleString()}</span>
+                  <span style={{...styles.risk, background: getColor(ep.risk)}}>{ep.risk}</span>
+                </div>
+              ))}
             </div>
+          </section>
+
+          <div style={styles.reupload} onClick={() => { setSpecFile(null); setTrafficFile(null); setAnalysis(emptyAnalysis); }}>
+            ↻ Start over
           </div>
-        )}
-
-        {/* Settings Modal */}
-        {showSettings && (
-          <div
-            onClick={() => setShowSettings(false)}
-            style={{
-              position: 'fixed',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              background: 'rgba(0,0,0,0.5)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              zIndex: 1000
-            }}
-          >
-            <div
-              onClick={(e) => e.stopPropagation()}
-              style={{
-                background: darkMode ? '#2d2d2d' : 'white',
-                borderRadius: '12px',
-                padding: '24px',
-                width: '90%',
-                maxWidth: '400px'
-              }}
-            >
-              <h2 style={{
-                fontSize: '20px',
-                fontWeight: '700',
-                marginBottom: '20px',
-                color: darkMode ? '#fff' : '#333'
-              }}>Settings</h2>
-
-              <div style={{
-                padding: '16px',
-                borderBottom: darkMode ? '1px solid #3d3d3d' : '1px solid #f0f0f0',
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center'
-              }}>
-                <span style={{ color: darkMode ? '#fff' : '#333' }}>Dark Mode</span>
-                <input
-                  type="checkbox"
-                  checked={darkMode}
-                  onChange={toggleDarkMode}
-                  style={{ cursor: 'pointer' }}
-                />
-              </div>
-
-              <button
-                onClick={handleDeleteAccount}
-                style={{
-                  width: '100%',
-                  padding: '12px',
-                  background: '#ef4444',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '8px',
-                  fontSize: '16px',
-                  fontWeight: '600',
-                  cursor: 'pointer',
-                  marginTop: '16px'
-                }}
-              >
-                Delete Account
-              </button>
-
-              <button
-                onClick={() => setShowSettings(false)}
-                style={{
-                  width: '100%',
-                  padding: '12px',
-                  background: darkMode ? '#3d3d3d' : '#f0f0f0',
-                  color: darkMode ? '#fff' : '#666',
-                  border: 'none',
-                  borderRadius: '8px',
-                  fontSize: '16px',
-                  fontWeight: '600',
-                  cursor: 'pointer',
-                  marginTop: '12px'
-                }}
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-    </>
+        </main>
+      )}
+    </div>
   );
 }
 
-export default Dashboard;
+const styles = {
+  container: { minHeight: '100vh', background: '#0a0f1a', color: '#e0e6ed', fontFamily: "'Space Grotesk', sans-serif" },
+  grid: { position: 'fixed', inset: 0, backgroundImage: 'linear-gradient(rgba(77,255,255,0.015) 1px, transparent 1px), linear-gradient(90deg, rgba(77,255,255,0.015) 1px, transparent 1px)', backgroundSize: '32px 32px', pointerEvents: 'none' },
+  
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 20px', borderBottom: '1px solid rgba(77,255,255,0.1)', background: 'rgba(10,15,26,0.95)', position: 'relative', zIndex: 1 },
+  logo: { display: 'flex', alignItems: 'center', gap: '10px' },
+  title: { fontSize: '14px', fontWeight: 600, letterSpacing: '2px', color: '#4dffff' },
+  badge: { fontSize: '11px', padding: '4px 10px', background: 'rgba(77,255,255,0.08)', border: '1px solid rgba(77,255,255,0.15)', fontFamily: 'monospace', color: '#4dffff' },
+
+  empty: { display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '80px 20px', position: 'relative', zIndex: 1 },
+  emptyTitle: { margin: '0 0 20px', fontSize: '16px', color: '#4dffff', letterSpacing: '1px', fontWeight: 500 },
+  fileChecks: { display: 'flex', gap: '10px', marginBottom: '20px' },
+  fileCheck: { display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', border: '1px solid', background: 'rgba(10,15,26,0.8)', fontSize: '12px' },
+  dropzone: { padding: '32px 48px', border: '2px dashed rgba(77,255,255,0.2)', color: '#6b7c93', fontSize: '13px', cursor: 'pointer', transition: 'all 0.2s' },
+  dropzoneActive: { borderColor: '#4dffff', background: 'rgba(77,255,255,0.05)', color: '#4dffff' },
+
+  main: { padding: '20px', maxWidth: '800px', margin: '0 auto', position: 'relative', zIndex: 1 },
+
+  health: { display: 'flex', alignItems: 'center', gap: '20px', padding: '16px', background: 'rgba(77,255,255,0.02)', border: '1px solid rgba(77,255,255,0.08)', marginBottom: '16px' },
+  ring: { position: 'relative', width: '100px', height: '100px' },
+  ringVal: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px', fontWeight: 700, fontFamily: 'monospace', color: '#4dffff' },
+  healthLabel: { fontSize: '12px', color: '#6b7c93', textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '6px' },
+  healthMeta: { fontSize: '13px', color: '#8b9cb3' },
+
+  stats: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '10px', marginBottom: '20px' },
+  stat: { padding: '14px', background: 'rgba(10,15,26,0.5)', border: '1px solid rgba(77,255,255,0.05)', textAlign: 'center' },
+  statNum: { display: 'block', fontSize: '22px', fontWeight: 700, fontFamily: 'monospace' },
+  statLbl: { fontSize: '10px', color: '#555', textTransform: 'uppercase', letterSpacing: '0.5px' },
+
+  section: { margin: '0 0 10px', fontSize: '11px', color: '#555', textTransform: 'uppercase', letterSpacing: '1px' },
+  sectionDesc: { margin: '-6px 0 12px', fontSize: '12px', color: '#6b7c93' },
+  
+  issues: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '20px' },
+  issue: { padding: '10px', background: 'rgba(10,15,26,0.5)', borderLeft: '3px solid' },
+  issueType: { fontSize: '9px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' },
+  issueField: { fontSize: '12px', fontFamily: 'monospace', marginBottom: '2px' },
+  issueDesc: { fontSize: '11px', color: '#6b7c93', marginBottom: '4px' },
+  issueMeta: { fontSize: '10px', color: '#444' },
+
+  risks: { display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '20px' },
+  riskRow: { display: 'flex', alignItems: 'center', padding: '10px 12px', background: 'rgba(10,15,26,0.5)', borderLeft: '3px solid', gap: '12px' },
+  riskAction: { fontSize: '10px', color: '#6b7c93', textTransform: 'uppercase', letterSpacing: '0.5px', minWidth: '140px' },
+  riskTarget: { flex: 1, fontSize: '12px', fontFamily: 'monospace', color: '#e0e6ed', fontWeight: 600 },
+  riskImpact: { fontSize: '11px', fontFamily: 'monospace', textAlign: 'right' },
+
+  usage: { display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '20px' },
+  usageRow: { display: 'flex', alignItems: 'center', gap: '10px', padding: '6px 0' },
+  usageField: { fontSize: '11px', fontFamily: 'monospace', color: '#8b9cb3', minWidth: '180px' },
+  usageBarWrap: { flex: 1, height: '6px', background: 'rgba(77,255,255,0.1)', borderRadius: '3px', overflow: 'hidden' },
+  usageBar: { height: '100%', borderRadius: '3px', transition: 'width 0.3s' },
+  usagePct: { fontSize: '11px', fontFamily: 'monospace', color: '#555', minWidth: '40px', textAlign: 'right' },
+
+  endpoints: { display: 'flex', flexDirection: 'column', gap: '4px' },
+  ep: { display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 10px', background: 'rgba(10,15,26,0.5)', border: '1px solid rgba(77,255,255,0.03)' },
+  method: { padding: '2px 6px', fontSize: '9px', fontWeight: 600, color: '#0a0f1a', borderRadius: '2px', minWidth: '44px', textAlign: 'center' },
+  path: { flex: 1, fontSize: '12px', fontFamily: 'monospace', color: '#7a8a9a' },
+  hits: { fontSize: '11px', fontFamily: 'monospace', color: '#555', minWidth: '50px', textAlign: 'right' },
+  risk: { padding: '2px 6px', fontSize: '8px', fontWeight: 600, color: '#0a0f1a', borderRadius: '2px', textTransform: 'uppercase' },
+
+  reupload: { marginTop: '20px', padding: '10px', textAlign: 'center', color: '#444', fontSize: '11px', cursor: 'pointer', border: '1px dashed rgba(77,255,255,0.08)' },
+};

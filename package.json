@@ -1,6 +1,6 @@
 {
-  "name": "application-tracker-app",
-  "homepage": "https://harrytmiller.github.io/application-tracker",
+  "name": "api-tracker-app",
+  "homepage": "https://harrytmiller.github.io/api-tracker",
   "version": "0.1.0",
   "private": true,
   "dependencies": {
