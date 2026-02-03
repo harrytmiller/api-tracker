@@ -255,11 +255,17 @@ export default function APIDashboard({ analysis: propAnalysis, onUpload }) {
           <div style={styles.fileChecks}>
             <div style={{...styles.fileCheck, borderColor: specFile ? '#4dff88' : '#333'}}>
               <span style={{ color: specFile ? '#4dff88' : '#555' }}>{specFile ? '✓' : '1'}</span>
-              <span>OpenAPI Spec</span>
+              <div>
+                <span>OpenAPI Spec</span>
+                <div style={styles.fileTypeHint}>.yaml .yml .json</div>
+              </div>
             </div>
             <div style={{...styles.fileCheck, borderColor: trafficFile ? '#4dff88' : '#333'}}>
               <span style={{ color: trafficFile ? '#4dff88' : '#555' }}>{trafficFile ? '✓' : '2'}</span>
-              <span>Traffic Data</span>
+              <div>
+                <span>Traffic Data</span>
+                <div style={styles.fileTypeHint}>.json .har</div>
+              </div>
             </div>
           </div>
           <div 
@@ -271,6 +277,7 @@ export default function APIDashboard({ analysis: propAnalysis, onUpload }) {
           >
             Drop files or click to browse
           </div>
+          <div style={styles.acceptedFormats}>Accepted formats: .yaml, .yml, .json, .har</div>
         </div>
       ) : (
         <main style={styles.main}>
@@ -405,8 +412,10 @@ const styles = {
   emptyTitle: { margin: '0 0 20px', fontSize: '16px', color: '#4dffff', letterSpacing: '1px', fontWeight: 500 },
   fileChecks: { display: 'flex', gap: '10px', marginBottom: '20px' },
   fileCheck: { display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', border: '1px solid', background: 'rgba(10,15,26,0.8)', fontSize: '12px' },
+  fileTypeHint: { fontSize: '10px', color: '#555', fontFamily: 'monospace', marginTop: '2px' },
   dropzone: { padding: '32px 48px', border: '2px dashed rgba(77,255,255,0.2)', color: '#6b7c93', fontSize: '13px', cursor: 'pointer', transition: 'all 0.2s' },
   dropzoneActive: { borderColor: '#4dffff', background: 'rgba(77,255,255,0.05)', color: '#4dffff' },
+  acceptedFormats: { marginTop: '12px', fontSize: '11px', color: '#444', fontFamily: 'monospace' },
 
   main: { padding: '20px', maxWidth: '800px', margin: '0 auto', position: 'relative', zIndex: 1 },
 
