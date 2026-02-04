@@ -247,7 +247,7 @@ export default function APIDashboard({ analysis: propAnalysis, onUpload }) {
 
       {!hasData ? (
         <div style={styles.empty}>
-          <svg width="56" height="56" viewBox="0 0 80 80" fill="none" style={{ opacity: 0.4, marginBottom: 16 }}>
+          <svg width="80" height="80" viewBox="0 0 80 80" fill="none" style={{ opacity: 0.4, marginBottom: 24 }}>
             <rect x="8" y="16" width="64" height="48" rx="2" stroke="#4dffff" strokeWidth="1.5" strokeDasharray="4 2" />
             <path d="M40 28v24M28 40l12-12 12 12" stroke="#4dffff" strokeWidth="1.5" />
           </svg>
@@ -277,7 +277,6 @@ export default function APIDashboard({ analysis: propAnalysis, onUpload }) {
           >
             Drop files or click to browse
           </div>
-          <div style={styles.acceptedFormats}>Accepted formats: .yaml, .yml, .json, .har</div>
         </div>
       ) : (
         <main style={styles.main}>
@@ -408,14 +407,13 @@ const styles = {
   title: { fontSize: '14px', fontWeight: 600, letterSpacing: '2px', color: '#4dffff' },
   badge: { fontSize: '11px', padding: '4px 10px', background: 'rgba(77,255,255,0.08)', border: '1px solid rgba(77,255,255,0.15)', fontFamily: 'monospace', color: '#4dffff' },
 
-  empty: { display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '80px 20px', position: 'relative', zIndex: 1 },
-  emptyTitle: { margin: '0 0 20px', fontSize: '16px', color: '#4dffff', letterSpacing: '1px', fontWeight: 500 },
-  fileChecks: { display: 'flex', gap: '10px', marginBottom: '20px' },
-  fileCheck: { display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', border: '1px solid', background: 'rgba(10,15,26,0.8)', fontSize: '12px' },
-  fileTypeHint: { fontSize: '10px', color: '#555', fontFamily: 'monospace', marginTop: '2px' },
-  dropzone: { padding: '32px 48px', border: '2px dashed rgba(77,255,255,0.2)', color: '#6b7c93', fontSize: '13px', cursor: 'pointer', transition: 'all 0.2s' },
+  empty: { display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '100px 20px', position: 'relative', zIndex: 1 },
+  emptyTitle: { margin: '0 0 32px', fontSize: '20px', color: '#4dffff', letterSpacing: '1px', fontWeight: 500 },
+  fileChecks: { display: 'flex', gap: '16px', marginBottom: '32px' },
+  fileCheck: { display: 'flex', alignItems: 'center', gap: '12px', padding: '16px 24px', border: '1px solid', background: 'rgba(10,15,26,0.8)', fontSize: '14px' },
+  fileTypeHint: { fontSize: '11px', color: '#555', fontFamily: 'monospace', marginTop: '4px' },
+  dropzone: { padding: '80px 120px', border: '2px dashed rgba(77,255,255,0.2)', color: '#6b7c93', fontSize: '15px', cursor: 'pointer', transition: 'all 0.2s' },
   dropzoneActive: { borderColor: '#4dffff', background: 'rgba(77,255,255,0.05)', color: '#4dffff' },
-  acceptedFormats: { marginTop: '12px', fontSize: '11px', color: '#444', fontFamily: 'monospace' },
 
   main: { padding: '20px', maxWidth: '800px', margin: '0 auto', position: 'relative', zIndex: 1 },
 
